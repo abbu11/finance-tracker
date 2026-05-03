@@ -1,13 +1,13 @@
 const router = require('express').Router();
 const auth   = require('../middleware/auth');
-const { generateRuleBasedInsights, enrichWithOpenAI } = require('../services/insightsService');
+const { generateAIInsights } = require('../services/insightsService');
 
 router.get('/', auth, async (req, res) => {
   try {
-    const insights = await generateRuleBasedInsights(req.user.id);
-    const enriched = await enrichWithOpenAI(insights, `User ID: ${req.user.id}`);
-    res.json(enriched);
+    const insights = await generateAIInsights(req.user.id);
+    res.json(insights);
   } catch (err) {
+    console.error('Insights route error:', err.message);
     res.status(500).json({ message: err.message });
   }
 });

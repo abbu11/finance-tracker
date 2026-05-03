@@ -1,13 +1,14 @@
 const Transaction = require('../models/Transaction');
 const mongoose    = require('mongoose');
+const OpenAI      = require('openai');
 
-async function generateRuleBasedInsights(userId) {
+async function analyzeSpending(userId) {
   const uid            = new mongoose.Types.ObjectId(userId);
   const now            = new Date();
   const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
-  const [thisMonth, lastMonth] = await Promise.all([
+  const [thisMonth, lastMonth, incomeAgg] = await Promise.all([
     Transaction.aggregate([
       { $match: { userId: uid, type: 'expense', date: { $gte: thisMonthStart } } },
       { $group: { _id: '$category', total: { $sum: '$amount' } } },
@@ -16,47 +17,48 @@ async function generateRuleBasedInsights(userId) {
       { $match: { userId: uid, type: 'expense', date: { $gte: lastMonthStart, $lt: thisMonthStart } } },
       { $group: { _id: '$category', total: { $sum: '$amount' } } },
     ]),
+    Transaction.aggregate([
+      { $match: { userId: uid, type: 'income', date: { $gte: thisMonthStart } } },
+      { $group: { _id: null, total: { $sum: '$amount' } } },
+    ]),
   ]);
 
-  const thisMap = Object.fromEntries(thisMonth.map(x => [x._id, x.total]));
-  const lastMap = Object.fromEntries(lastMonth.map(x => [x._id, x.total]));
-  const insights = [];
+  const thisMap     = Object.fromEntries(thisMonth.map(x => [x._id, x.total]));
+  const lastMap     = Object.fromEntries(lastMonth.map(x => [x._id, x.total]));
+  const income      = incomeAgg[0]?.total || 0;
+  const totalSpend  = thisMonth.reduce((s, x) => s + x.total, 0);
+  const savingsRate = income > 0 ? ((income - totalSpend) / income) * 100 : 0;
 
+  const changes = [];
   for (const [cat, amount] of Object.entries(thisMap)) {
     const prev = lastMap[cat] || 0;
-    if (prev > 0) {
-      const pct = ((amount - prev) / prev) * 100;
-      if (pct > 30) {
-        insights.push({
-          type:     'overspending',
-          title:    `${cap(cat)} up ${pct.toFixed(0)}%`,
-          message:  `You spent $${amount.toFixed(2)} on ${cat} vs $${prev.toFixed(2)} last month.`,
-          severity: pct > 60 ? 'high' : 'medium',
-        });
-      }
+    const pct  = prev > 0 ? ((amount - prev) / prev) * 100 : null;
+    changes.push({ category: cat, amount, prev, pct });
+  }
+
+  return { thisMap, lastMap, income, totalSpend, savingsRate, changes, thisMonth };
+}
+
+async function generateRuleBasedInsights(userId) {
+  const { thisMap, income, totalSpend, savingsRate, changes, thisMonth } = await analyzeSpending(userId);
+  const insights = [];
+
+  for (const { category, amount, prev, pct } of changes) {
+    if (pct !== null && pct > 30) {
+      insights.push({
+        type: 'overspending',
+        title: `${cap(category)} up ${pct.toFixed(0)}%`,
+        message: `You spent $${amount.toFixed(2)} on ${category} vs $${prev.toFixed(2)} last month.`,
+        severity: pct > 60 ? 'high' : 'medium',
+      });
     }
   }
 
-  const [incAgg, expAgg] = await Promise.all([
-    Transaction.aggregate([
-      { $match: { userId: uid, type: 'income',  date: { $gte: thisMonthStart } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]),
-    Transaction.aggregate([
-      { $match: { userId: uid, type: 'expense', date: { $gte: thisMonthStart } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]),
-  ]);
-
-  const income  = incAgg[0]?.total || 0;
-  const expense = expAgg[0]?.total || 0;
-
   if (income > 0) {
-    const rate = ((income - expense) / income) * 100;
-    if (rate < 10) {
-      insights.push({ type: 'savings', title: 'Low savings rate', message: `You're saving only ${rate.toFixed(1)}% of income. Aim for 20%+.`, severity: 'high' });
-    } else if (rate >= 20) {
-      insights.push({ type: 'positive', title: 'Great savings rate!', message: `You saved ${rate.toFixed(1)}% of income this month.`, severity: 'low' });
+    if (savingsRate < 10) {
+      insights.push({ type: 'savings', title: 'Low savings rate', message: `Saving only ${savingsRate.toFixed(1)}% of income. Target 20%+.`, severity: 'high' });
+    } else if (savingsRate >= 20) {
+      insights.push({ type: 'positive', title: 'Great savings rate!', message: `You saved ${savingsRate.toFixed(1)}% of income this month.`, severity: 'low' });
     }
   }
 
@@ -68,24 +70,59 @@ async function generateRuleBasedInsights(userId) {
   return insights;
 }
 
-async function enrichWithOpenAI(insights, summaryText) {
-  if (!process.env.OPENAI_API_KEY) return insights;
+async function generateAIInsights(userId) {
+  const ruleInsights = await generateRuleBasedInsights(userId);
+
+  if (!process.env.OPENAI_API_KEY) {
+    console.log('No OpenAI key — using rule-based only');
+    return ruleInsights;
+  }
+
   try {
-    const OpenAI = require('openai');
-    const client = new OpenAI();
-    const prompt = `You are a personal finance advisor. Observations:\n${insights.map(i => `- ${i.title}: ${i.message}`).join('\n')}\nProvide 2 actionable savings tips as JSON array: [{"title":"...","message":"...","type":"tip","severity":"low"}]`;
-    const res = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 400,
+    const { thisMap, income, totalSpend, savingsRate } = await analyzeSpending(userId);
+
+    const spendingBreakdown = Object.entries(thisMap)
+      .map(([cat, amt]) => `  - ${cap(cat)}: $${amt.toFixed(2)}`)
+      .join('\n');
+
+    const prompt = `You are a friendly personal finance advisor analyzing real spending data.
+
+## This Month
+- Income: $${income.toFixed(2)}
+- Expenses: $${totalSpend.toFixed(2)}
+- Savings Rate: ${savingsRate.toFixed(1)}%
+
+## Spending Breakdown
+${spendingBreakdown || '  No expenses yet'}
+
+Give exactly 3 personalized actionable tips based on these REAL numbers.
+Mention actual dollar amounts. Be specific and encouraging. Max 2 sentences each.
+
+Respond ONLY with this JSON (no markdown, no backticks):
+{"tips":[{"title":"...","message":"...","type":"tip","severity":"low"},{"title":"...","message":"...","type":"tip","severity":"low"},{"title":"...","message":"...","type":"tip","severity":"low"}]}`;
+
+    const client   = new OpenAI();
+    const response = await client.chat.completions.create({
+      model:       'gpt-4o-mini',
+      max_tokens:  600,
+      temperature: 0.7,
+      messages:    [{ role: 'user', content: prompt }],
     });
-    const text = res.choices[0].message.content.replace(/```json|```/g, '').trim();
-    const tips = JSON.parse(text);
-    return [...insights, ...(Array.isArray(tips) ? tips : [])];
-  } catch {
-    return insights;
+
+    const raw = response.choices[0].message.content.trim();
+    console.log('OpenAI raw response:', raw);
+
+    const json = JSON.parse(raw);
+    const tips = json.tips || [];
+    console.log(`OpenAI returned ${tips.length} tips`);
+
+    return [...ruleInsights, ...tips];
+
+  } catch (err) {
+    console.error('OpenAI error:', err.message, '| Status:', err.status, '| Code:', err.code);
+    return ruleInsights;
   }
 }
 
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
-module.exports = { generateRuleBasedInsights, enrichWithOpenAI };
+const cap = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+module.exports = { generateRuleBasedInsights, generateAIInsights };
